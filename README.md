@@ -15,7 +15,19 @@
 - Устанавливает пакет `perplexity-comet-mcp`
 - Создаёт готовый фрагмент `mcp.json`
 
-**Запуск:**
+**Быстрая установка (одной строкой):**
+
+```powershell
+irm https://raw.githubusercontent.com/15230041523004/lms-tools/main/install-comet-mcp.ps1 | iex
+```
+
+Если политика выполнения блокирует:
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force; irm https://raw.githubusercontent.com/15230041523004/lms-tools/main/install-comet-mcp.ps1 | iex
+```
+
+**Локальный запуск:**
 
 ```powershell
 # PowerShell (желательно от администратора при первой установке Node.js)
