@@ -2,6 +2,7 @@
 #  Установка Comet MCP для LM Studio
 #  (Perplexity Comet через MCP)
 #  Windows 11 — финальная версия
+#  Фикс: полный путь к npx.cmd + Path для LM Studio
 # ============================================
 
 Write-Host "`n=== Установка Comet MCP для LM Studio ===" -ForegroundColor Cyan
@@ -16,6 +17,31 @@ function Test-Node {
         } catch {}
     }
     return $false
+}
+
+function Get-NpxCmdPath {
+    $candidates = @(
+        "C:\Program Files\nodejs\npx.cmd",
+        "${env:ProgramFiles}\nodejs\npx.cmd",
+        "${env:ProgramFiles(x86)}\nodejs\npx.cmd"
+    )
+    foreach ($p in $candidates) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    $fromWhere = Get-Command npx.cmd -ErrorAction SilentlyContinue
+    if ($fromWhere -and $fromWhere.Source) { return $fromWhere.Source }
+    return $null
+}
+
+function Get-NodeDir {
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($nodeCmd -and $nodeCmd.Source) {
+        return (Split-Path -Parent $nodeCmd.Source)
+    }
+    if (Test-Path "C:\Program Files\nodejs\node.exe") {
+        return "C:\Program Files\nodejs"
+    }
+    return "C:\Program Files\nodejs"
 }
 
 # 1. Проверка / установка Node.js
@@ -96,20 +122,27 @@ if ($installSuccess) {
     exit 1
 }
 
-# 4. Проверка команды
-Write-Host "`n[4/5] Проверяю команду..." -ForegroundColor Yellow
+# 4. Ищем npx.cmd (LM Studio не видит PATH)
+Write-Host "`n[4/5] Ищу npx.cmd..." -ForegroundColor Yellow
 
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 
-$cometCmd = Get-Command perplexity-comet-mcp -ErrorAction SilentlyContinue
-if ($cometCmd) {
-    Write-Host "Команда perplexity-comet-mcp доступна." -ForegroundColor Green
-} else {
-    Write-Host "Команда пока не видна в PATH (это нормально)." -ForegroundColor Yellow
-    Write-Host "Она появится после перезапуска терминала или LM Studio." -ForegroundColor Yellow
+$npxCmd = Get-NpxCmdPath
+$nodeDir = Get-NodeDir
+
+if (-not $npxCmd) {
+    Write-Host "npx.cmd не найден! Проверь установку Node.js." -ForegroundColor Red
+    exit 1
 }
 
-# 5. Создаём конфиг
+# JSON-экранирование пути (обратные слэши → \\ )
+$npxCmdJson = $npxCmd -replace "\\", "\\"
+$nodeDirJson = $nodeDir -replace "\\", "\\"
+
+Write-Host "npx.cmd: $npxCmd" -ForegroundColor Green
+Write-Host "Node dir: $nodeDir" -ForegroundColor Green
+
+# 5. Создаём рабочий mcp.json-фрагмент для LM Studio
 Write-Host "`n[5/5] Создаю готовый фрагмент mcp.json..." -ForegroundColor Yellow
 
 $configDir = "$env:USERPROFILE\comet-mcp-config"
@@ -119,7 +152,11 @@ $mcpSnippet = @"
 {
   "mcpServers": {
     "comet-bridge": {
-      "command": "perplexity-comet-mcp"
+      "command": "$npxCmdJson",
+      "args": ["-y", "perplexity-comet-mcp"],
+      "env": {
+        "Path": "$nodeDirJson;C:\\Windows\\System32"
+      }
     }
   }
 }
@@ -142,11 +179,12 @@ Write-Host ""
 Write-Host "2. В LM Studio:" -ForegroundColor White
 Write-Host "   • Справа → Program" -ForegroundColor White
 Write-Host "   • Install → Edit mcp.json" -ForegroundColor White
-Write-Host "   • Вставь это:" -ForegroundColor White
+Write-Host "   • Вставь это (уже с полным путём — LM Studio иначе не видит node/npx):" -ForegroundColor White
 Write-Host ""
 Write-Host $mcpSnippet -ForegroundColor Gray
 Write-Host ""
-Write-Host "3. Сохрани файл и включи сервер comet-bridge" -ForegroundColor White
+Write-Host "3. Сохрани файл → Restart у mcp/comet-bridge" -ForegroundColor White
+Write-Host "4. Красный треугольник должен пропасть" -ForegroundColor White
 Write-Host ""
 Write-Host "Готовый файл также лежит здесь:" -ForegroundColor Yellow
 Write-Host $snippetPath -ForegroundColor Cyan
