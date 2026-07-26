@@ -13,7 +13,7 @@
 **Что делает:**
 - Проверяет / устанавливает Node.js (через winget или MSI)
 - Устанавливает пакет `perplexity-comet-mcp`
-- Создаёт готовый фрагмент `mcp.json`
+- Создаёт готовый фрагмент `mcp.json` с **полным путём** к `npx.cmd` и `Path` (LM Studio на Windows иначе не видит node/npx)
 
 **Быстрая установка (одной строкой):**
 
@@ -30,23 +30,27 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; irm https://raw.githubusercont
 **Локальный запуск:**
 
 ```powershell
-# PowerShell (желательно от администратора при первой установке Node.js)
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 .\install-comet-mcp.ps1
 ```
 
 **После установки:**
 1. Скачай браузер [Comet](https://www.perplexity.ai/comet)
-2. В LM Studio → Program → Install → Edit `mcp.json` вставь:
+2. В LM Studio → Program → Install → Edit `mcp.json` вставь конфиг из вывода скрипта (или вручную):
 
 ```json
 {
   "mcpServers": {
     "comet-bridge": {
-      "command": "perplexity-comet-mcp"
+      "command": "C:\\Program Files\\nodejs\\npx.cmd",
+      "args": ["-y", "perplexity-comet-mcp"],
+      "env": {
+        "Path": "C:\\Program Files\\nodejs;C:\\Windows\\System32"
+      }
     }
   }
 }
 ```
 
-3. Включи сервер `comet-bridge` и используй модель с tool calling.
+3. Сохрани → **Restart** у `mcp/comet-bridge` (красный треугольник должен пропасть)
+4. Используй модель с **tool calling** + system prompt, который требует реальные tool calls (не текстовую симуляцию)
