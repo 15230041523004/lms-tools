@@ -1,39 +1,39 @@
 # lms-tools
 
-Набор скриптов и утилит для локальных LLM на Windows (LM Studio, TextGen и связанное).
+Скрипты для локальных LLM на Windows: **TextGen (oobabooga) + Comet MCP из коробки**.
 
-## Скрипты
+## Скрипт
 
 | Файл | Назначение |
 |------|------------|
-| [`install-comet-mcp.ps1`](install-comet-mcp.ps1) | Perplexity Comet MCP для LM Studio (облачный поиск) |
-| [`textgen-8060s.ps1`](textgen-8060s.ps1) | TextGen (oobabooga): установка / запуск / удаление, AMD Radeon 8060S |
+| [`textgen-8060s.ps1`](textgen-8060s.ps1) | TextGen: установка / запуск / удаление + **Comet MCP** (Node, bridge, CDP, `mcp.json`) |
+
+Отдельный установщик Comet MCP для LM Studio **не нужен** и удалён: при работе через TextGen всё делает `textgen-8060s.ps1`.
 
 ---
 
 ### `textgen-8060s.ps1`
 
-Один PowerShell-скрипт для **portable TextGen** (не conda one-click — на Windows AMD/ROCm через conda не ставится).
+Один PowerShell-скрипт: **portable TextGen** + автоматический **Comet MCP** (stdio bridge + браузер Comet с CDP).
+
+**Первый запуск** = установка всего недостающего (TextGen zip, Node, bridge, Comet при необходимости) + hardlink моделей LM Studio + старт.  
+**Повторные запуски** = быстрый путь: bridge уже собран, порты освобождаются, `mcp.json` merge, Comet CDP, TextGen.
 
 **Что делает:**
 - Скачивает portable zip с GitHub Releases (`windows-rocm` или `windows-vulkan`)
-- Ставит в `C:\textgen-8060s`
-- Пишет `CMD_FLAGS` (`--listen 0.0.0.0`, API, llama.cpp, gpu-layers -1)
-- Показывает **все** LAN IP (Wi‑Fi, Ethernet, vEthernet, …)
-- Запускает UI
-- Удаление с меню (оставить модели / снести всё)
+- Ставит в `C:\textgen-8060s` (если нет прав записи → `%LOCALAPPDATA%\textgen-8060s`)
+- Пишет `CMD_FLAGS`: UI на LAN + **OpenAI-compatible API**  
+  `--listen --listen-host 0.0.0.0 --api --api-port 5000 --api-key sk-local`
+- Открывает firewall на портах UI (7860) и API (5000)
+- **По умолчанию** делает hardlink (или symlink) всех `*.gguf` из `%USERPROFILE%\.lmstudio\models` → `user_data\models`
+- Собирает MCP bridge (`perplexity-comet-mcp`) в `%LOCALAPPDATA%\comet-mcp-fixed`
+- Пишет/мержит `user_data\mcp.json` с **stdio** сервером `comet-bridge`
+- Запускает Comet с профилем `Comet-MCP-Profile` и CDP на **9223**
+- Удаление с меню (включая MCP-only)
 
 **Быстрый старт:**
 
 ```powershell
-# из cmd / PowerShell (нужна обычная консоль, не ISE)
-powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\textgen-8060s.ps1
-```
-
-Или одной строкой с raw GitHub:
-
-```powershell
-irm https://raw.githubusercontent.com/15230041523004/lms-tools/main/textgen-8060s.ps1 -OutFile textgen-8060s.ps1
 powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\textgen-8060s.ps1
 ```
 
@@ -41,80 +41,48 @@ powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\textgen-8060s.ps1
 
 | Ключ | Действие |
 |------|----------|
-| (по умолчанию) | install при необходимости + run, backend спросить (Enter = ROCm) |
-| `-Backend ROCm` | portable ROCm |
-| `-Backend Vulkan` | portable Vulkan |
+| (по умолчанию) | install + MCP + **link LM Studio models** + run |
+| `-Backend ROCm` / `Vulkan` | portable backend |
 | `-Reinstall` | перекачать app |
-| `-NoRun` | только установить |
+| `-NoRun` | только установить, не стартовать UI |
+| `-SkipMcp` | без Node/Comet/bridge |
+| `-SkipModelLinks` | **не** линковать GGUF из LM Studio |
+| `-LinkModels` | пересоздать ссылки (если файл уже есть — заменить) |
+| `-ApiPort` / `-ApiKey` / `-ListenPort` | API и UI |
 | `-Uninstall` | меню удаления |
-| `-InstallRoot путь` | другой каталог (по умолчанию `C:\textgen-8060s`) |
+| `-InstallRoot путь` | каталог установки |
 
-**Удаление (`-Uninstall`):**
-
-1. EVERYTHING — app + user_data + models + logs + firewall  
-2. APP ONLY — движок, **модели оставить**  
-3. APP + LOGS — модели оставить  
-4. CANCEL  
-
-После выбора нужно ввести **`YES`**.
+**Повторный запуск:** останавливает предыдущий TextGen и освобождает **7860** / **5000**.
 
 **После установки:**
 - UI: `http://127.0.0.1:7860`
-- API: `http://127.0.0.1:5000/v1`
-- Модели (GGUF): `C:\textgen-8060s\user_data\models`
-- Флаги: `C:\textgen-8060s\user_data\CMD_FLAGS.txt`
+- API: `http://127.0.0.1:5000/v1` · key `sk-local`
+- Модели: `…\user_data\models` (ссылки на LM Studio GGUF)
+- MCP stdio: `…\user_data\mcp.json`
+- Comet CDP: `http://127.0.0.1:9223/json/version`
 
-> На Radeon 8060S при проблемах с ROCm: `-Backend Vulkan -Reinstall`.
+### MCP в UI TextGen (важно)
 
----
+Поле **«MCP servers»** в sidebar чата — **только для HTTP** URL (по одному на строку).
 
-### `install-comet-mcp.ps1`
+**Comet настроен через stdio** в файле `user_data\mcp.json`.  
+**Оставьте HTTP-бокс пустым** — это нормально. Скрипт пишет `mcp.json` сам.
 
-Установщик **Perplexity Comet MCP** для LM Studio.
+Чтобы tools Comet появились:
 
-> ⚠️ Это облачное решение (Perplexity), не полностью локальное.
+1. В логе старта TextGen должно быть, что найден `mcp.json`
+2. Режим **Instruct** или **Chat-Instruct** (в чистом Chat tools часто скрыты)
+3. Модель **с tool calling**
+4. В sidebar включить tools (чекбоксы), когда MCP-сервер подключится
+5. В отдельном окне Comet (MCP-профиль) при первом разе — логин Perplexity
 
-**Что делает:**
-- Проверяет / устанавливает Node.js (через winget или MSI)
-- Устанавливает пакет `perplexity-comet-mcp`
-- Создаёт готовый фрагмент `mcp.json` с **полным путём** к `npx.cmd` и `Path` (LM Studio на Windows иначе не видит node/npx)
+### Cline / n8n (LAN)
 
-**Быстрая установка (одной строкой):**
+| Поле | Значение |
+|------|----------|
+| Base URL | `http://<LAN-IP>:5000/v1` |
+| API Key | `sk-local` |
 
-```powershell
-irm https://raw.githubusercontent.com/15230041523004/lms-tools/main/install-comet-mcp.ps1 | iex
-```
+Модель должна быть загружена в TextGen.
 
-Если политика выполнения блокирует:
-
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force; irm https://raw.githubusercontent.com/15230041523004/lms-tools/main/install-comet-mcp.ps1 | iex
-```
-
-**Локальный запуск:**
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-.\install-comet-mcp.ps1
-```
-
-**После установки:**
-1. Скачай браузер [Comet](https://www.perplexity.ai/comet)
-2. В LM Studio → Program → Install → Edit `mcp.json` вставь конфиг из вывода скрипта (или вручную):
-
-```json
-{
-  "mcpServers": {
-    "comet-bridge": {
-      "command": "C:\\Program Files\\nodejs\\npx.cmd",
-      "args": ["-y", "perplexity-comet-mcp"],
-      "env": {
-        "Path": "C:\\Program Files\\nodejs;C:\\Windows\\System32"
-      }
-    }
-  }
-}
-```
-
-3. Сохрани → **Restart** у `mcp/comet-bridge` (красный треугольник должен пропасть)
-4. Используй модель с **tool calling** + system prompt, который требует реальные tool calls (не текстовую симуляцию)
+> ROCm проблемы на 8060S: `-Backend Vulkan -Reinstall`.
