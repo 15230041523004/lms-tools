@@ -26,6 +26,7 @@
   `--listen --listen-host 0.0.0.0 --api --api-port 5000 --api-key sk-local`
 - Открывает firewall на портах UI (7860) и API (5000)
 - **По умолчанию** делает hardlink (или symlink) всех `*.gguf` из `%USERPROFILE%\.lmstudio\models` → `user_data\models`
+- Создаёт **`user_data\characters\Assistant.json`** (нужен для `/v1/chat/completions` и Cline)
 - Собирает MCP bridge (`perplexity-comet-mcp`) в `%LOCALAPPDATA%\comet-mcp-fixed`
 - Пишет/мержит `user_data\mcp.json` с **stdio** сервером `comet-bridge`
 - Запускает Comet с профилем `Comet-MCP-Profile` и CDP на **9223**
@@ -48,6 +49,7 @@ powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\textgen-8060s.ps1
 | `-SkipMcp` | без Node/Comet/bridge |
 | `-SkipModelLinks` | **не** линковать GGUF из LM Studio |
 | `-LinkModels` | пересоздать ссылки (если файл уже есть — заменить) |
+| `-SkipDefaultCharacter` | **не** создавать `characters\Assistant.json` |
 | `-ApiPort` / `-ApiKey` / `-ListenPort` | API и UI |
 | `-Uninstall` | меню удаления |
 | `-InstallRoot путь` | каталог установки |
@@ -58,8 +60,25 @@ powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\textgen-8060s.ps1
 - UI: `http://127.0.0.1:7860`
 - API: `http://127.0.0.1:5000/v1` · key `sk-local`
 - Модели: `…\user_data\models` (ссылки на LM Studio GGUF)
+- Character: `…\user_data\characters\Assistant.json` (для chat API)
 - MCP stdio: `…\user_data\mcp.json`
 - Comet CDP: `http://127.0.0.1:9223/json/version`
+
+### Fix 500: missing character `Assistant`
+
+TextGen при `POST /v1/chat/completions` по умолчанию грузит персонажа **`Assistant`**.  
+Если нет файла `user_data\characters\Assistant.json`, в логе:
+
+```text
+Could not find the character "Assistant" … ValueError → HTTP 500
+```
+
+Cline при этом часто показывает `UND_ERR_SOCKET` / terminated.
+
+**Скрипт создаёт `Assistant.json` автоматически** при каждом запуске (если файла ещё нет).  
+Существующий файл **не** перезаписывается. Отключить: `-SkipDefaultCharacter`.
+
+Уже установленный TextGen: просто перезапустите `textgen-8060s.ps1` (или `-NoRun`) — файл появится.
 
 ### MCP в UI TextGen (важно)
 
@@ -80,9 +99,11 @@ powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\textgen-8060s.ps1
 
 | Поле | Значение |
 |------|----------|
-| Base URL | `http://<LAN-IP>:5000/v1` |
+| Base URL (этот ПК) | `http://127.0.0.1:5000/v1` |
+| Base URL (LAN) | `http://<LAN-IP>:5000/v1` |
 | API Key | `sk-local` |
+| Model ID | из `GET /v1/models` (модель **загружена** в UI) |
 
-Модель должна быть загружена в TextGen.
+Нужны: работающий API, **`Assistant.json`**, загруженная модель.
 
 > ROCm проблемы на 8060S: `-Backend Vulkan -Reinstall`.
