@@ -6,7 +6,9 @@
 
 | Файл | Назначение |
 |------|------------|
-| [`textgen-8060s.ps1`](textgen-8060s.ps1) | TextGen: установка / запуск / удаление + **Comet MCP** (Node, bridge, CDP, `mcp.json`) |
+| [`textgen-8060s.ps1`](textgen-8060s.ps1) | TextGen: установка / запуск / удаление + **Comet MCP** + **llama_log_viewer** |
+| [`llama_log_viewer/script.py`](llama_log_viewer/script.py) | Расширение TextGen: вкладка полного консольного лога |
+| [`_cmd_flags_codec.py`](_cmd_flags_codec.py) | Python `shlex` codec для merge `CMD_FLAGS.txt` |
 
 Отдельный установщик Comet MCP для LM Studio **не нужен** и удалён: при работе через TextGen всё делает `textgen-8060s.ps1`.
 
@@ -27,6 +29,8 @@
 - Открывает firewall на портах UI (7860) и API (5000)
 - **По умолчанию** делает hardlink (или symlink) всех `*.gguf` из `%USERPROFILE%\.lmstudio\models` → `user_data\models`
 - Создаёт **`user_data\characters\Assistant.json`** (нужен для `/v1/chat/completions` и Cline)
+- Ставит расширение **`llama_log_viewer`** → вкладка **Llama Logs** в UI
+  (полный stdout/stderr процесса TextGen вместе с выводом llama-server)
 - Собирает MCP bridge (`perplexity-comet-mcp`) в `%LOCALAPPDATA%\comet-mcp-fixed`
 - Пишет/мержит `user_data\mcp.json` с **stdio** сервером `comet-bridge`
 - Запускает Comet с профилем `Comet-MCP-Profile` и CDP на **9223**
@@ -50,6 +54,7 @@ powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\textgen-8060s.ps1
 | `-SkipModelLinks` | **не** линковать GGUF из LM Studio |
 | `-LinkModels` | пересоздать ссылки (если файл уже есть — заменить) |
 | `-SkipDefaultCharacter` | **не** создавать `characters\Assistant.json` |
+| `-DisableLlamaLogViewer` | **не** ставить вкладку логов: удаляет deploy из `user_data\extensions` и убирает из `--extensions` |
 | `-ApiPort` / `-ApiKey` / `-ListenPort` | API и UI |
 | `-Uninstall` | меню удаления |
 | `-InstallRoot путь` | каталог установки |
@@ -63,6 +68,44 @@ powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\textgen-8060s.ps1
 - Character: `…\user_data\characters\Assistant.json` (для chat API)
 - MCP stdio: `…\user_data\mcp.json`
 - Comet CDP: `http://127.0.0.1:9223/json/version`
+- Console logs tab: UI → **Llama Logs** · текущий файл `logs\textgen-YYYYMMDD-HHMMSS.log`
+
+### Вкладка Llama Logs (`llama_log_viewer` v1.7)
+
+Показывает вывод, начинающийся со строки TextGen `INFO Starting TextGen`: сообщения
+родительского TextGen, весь stderr llama-server и строки после загрузки модели
+(`Loaded`, `LOADER`, `CONTEXT LENGTH`). Вывод launcher/MCP setup и служебная шапка
+PowerShell transcript в файл не попадают.
+
+**Зачем:** в portable TextGen + ROCm удобно смотреть полный консольный лог (загрузка
+модели, ошибки llama-server, OOM) прямо во вкладке UI, без отдельного окна PowerShell
+и без ручного «Обновить».
+
+**Польза:**
+- Живой хвост лога во время старта/инференса (diff с диска, не перечитывает весь файл)
+- Long-poll (~12 с удержания, если файл не растёт) — UI не «дубеет» от кликов каждую секунду
+- Автоскролл, подгрузка старых кусков при скролле вверх, снятие ANSI
+- Footer «Обновлено» / «Запись в файл» без мигания (статичный HTML + клиентские метки)
+- Область лога на высоту вкладки, footer у низа окна
+
+| | |
+|--|--|
+| Как включается | `textgen-8060s.ps1` tees stdout/stderr `textgen.bat` в файл и в консоль; extension **только читает** файл |
+| Когда появляется файл | сразу при старте `textgen.bat`, до первой строки `INFO Starting TextGen` |
+| Жизненный цикл | каждый запуск → новый `logs\textgen-YYYYMMDD-HHMMSS.log`; `log_path.txt` указывает вкладке на текущий |
+| Вывод | Один tee: TextGen parent + llama-server + `Loaded` / `LOADER` / `CONTEXT LENGTH` |
+| UI | **long-poll** через hidden `#llama-log-poll` (`queue=False`); JS boot: HTML `img.onload` + `eval(atob(...))` (TextGen **не** вызывает extension `custom_js()`); **Автоскролл**; footer; layout fill; ANSI strip |
+| Deploy | `user_data\extensions\llama_log_viewer\script.py` + sidecar `log_path.txt` |
+| Отключить | `-DisableLlamaLogViewer` |
+
+Native `LLAMA_ARG_LOG_FILE` / `--log-file` и `Start-Transcript` намеренно не используются: первый не создавал файл в конкретной ROCm-сборке, а второй не захватывал реальный вывод дочернего `textgen.bat`.
+
+**CMD_FLAGS / Python:**
+- **Bootstrap** (пусто/нет файла/managed-шаблон) — **без Python**. В логе: `CMD_FLAGS engine: v3-bootstrap`.
+- **Merge** кастомного файла — только **system** `py -3` / `python` (timeout 60s).
+  **`portable_env` / ROCm Python для codec запрещён** (из‑за зависаний).
+- Нет system Python при кастомном `CMD_FLAGS` → rewrite managed-шаблона (с предупреждением), установка не зависает.
+- Если в логе всё ещё `CMD_FLAGS Python: ...\portable_env\...` — запускается **старая** копия скрипта; берите `textgen-8060s.ps1` из этого репо.
 
 ### Fix 500: missing character `Assistant`
 

@@ -3,6 +3,7 @@
   textgen-8060s.ps1 — install / run / uninstall + Comet MCP
   AMD Radeon 8060S | Portable TextGen | default ROCm
   + automatic MCP bridge + Comet CDP (port 9223)
+  + llama_log_viewer extension (live TextGen stdout/stderr log)
 
   First run  = install TextGen (if needed) + Node/Git/bridge/Comet as needed + run
   Later runs = start Comet CDP (if needed) + rewrite/merge mcp.json + run TextGen
@@ -10,6 +11,8 @@
   OpenAI-compatible API (LAN): --api --api-port 5000 --api-key sk-local
   Base URL for Cline / n8n / OpenAI clients: http://<LAN-IP>:5000/v1
   Auto-creates user_data\characters\Assistant.json (required by /v1/chat/completions)
+  Auto-deploys llama_log_viewer; shows TextGen + llama-server output
+  Disable viewer: -DisableLlamaLogViewer (removes deploy + extensions entry)
 
   Запуск:
     powershell -ExecutionPolicy Bypass -File textgen-8060s.ps1
@@ -18,6 +21,7 @@
     powershell -ExecutionPolicy Bypass -File textgen-8060s.ps1 -NoRun
     powershell -ExecutionPolicy Bypass -File textgen-8060s.ps1 -SkipMcp
     powershell -ExecutionPolicy Bypass -File textgen-8060s.ps1 -ApiKey sk-local
+    powershell -ExecutionPolicy Bypass -File textgen-8060s.ps1 -DisableLlamaLogViewer
   Удаление:
     powershell -ExecutionPolicy Bypass -File textgen-8060s.ps1 -Uninstall
 #>
@@ -35,7 +39,8 @@ param(
     [switch]$SkipMcp,              # skip entire MCP stack
     [switch]$SkipModelLinks,       # do not hardlink LM Studio GGUFs into TextGen models
     [switch]$LinkModels,           # force re-scan / link (default already links when GGUF found)
-    [switch]$SkipDefaultCharacter  # do not auto-create user_data\characters\Assistant.json
+    [switch]$SkipDefaultCharacter, # do not auto-create user_data\characters\Assistant.json
+    [switch]$DisableLlamaLogViewer # remove viewer deploy + strip --extensions
 )
 
 $ErrorActionPreference = "Stop"
@@ -198,44 +203,477 @@ function Get-AllLanIPv4 {
     $list | Sort-Object IP -Unique
 }
 
-function Get-DefaultCmdFlags {
-    return @"
---listen
---listen-host 0.0.0.0
---listen-port $ListenPort
---api
---api-port $ApiPort
---api-key $ApiKey
---loader llama.cpp
---gpu-layers -1
---ctx-size 0
---cache-type q8_0
+# ===================== CMD_FLAGS / llama_log_viewer =====================
+# Codec: Python shlex.split/join only (same as TextGen). No PowerShell shlex fallback.
+
+function Get-ScriptRootDir {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    if ($MyInvocation.MyCommand.Path) {
+        return (Split-Path -Parent $MyInvocation.MyCommand.Path)
+    }
+    return (Get-Location).Path
+}
+
+function Test-PythonUsable {
+    # Returns [pscustomobject]@{ Ok; ExitCode; Detail }
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$PrefixArgs = @(),
+        [string]$WorkDir = $null
+    )
+    try {
+        if (-not $WorkDir) {
+            try { $WorkDir = Split-Path -Parent $Exe } catch { $WorkDir = $null }
+        }
+        $r = Invoke-Native -FilePath $Exe -ArgumentList ($PrefixArgs + @("-c", "import json, shlex")) -WorkDir $WorkDir
+        $detail = ($r.Output | Select-Object -First 3) -join " | "
+        return [pscustomobject]@{
+            Ok       = ($r.ExitCode -eq 0)
+            ExitCode = $r.ExitCode
+            Detail   = $detail
+            WorkDir  = $WorkDir
+        }
+    } catch {
+        return [pscustomobject]@{
+            Ok       = $false
+            ExitCode = -1
+            Detail   = $_.Exception.Message
+            WorkDir  = $WorkDir
+        }
+    }
+}
+
+function Get-ManagedCmdFlagsTemplate {
+    # Fixed managed-only flags (safe tokens only). No user content → no shlex needed to write.
+    $lines = @(
+        "--listen"
+        "--listen-host 0.0.0.0"
+        "--listen-port $ListenPort"
+        "--api"
+        "--api-port $ApiPort"
+        "--api-key $ApiKey"
+        "--loader llama.cpp"
+        "--gpu-layers -1"
+        "--ctx-size 0"
+        "--cache-type q8_0"
+    )
+    if (-not $DisableLlamaLogViewer) {
+        $lines += "--extensions llama_log_viewer"
+    }
+    return (($lines -join "`n") + "`n")
+}
+
+function Normalize-CmdFlagsText([string]$Text) {
+    if ($null -eq $Text) { return "" }
+    return (($Text -replace "`r`n", "`n") -replace "`r", "`n").TrimEnd()
+}
+
+function Test-CmdFlagsNeedsPythonMerge {
+    # True when file has content that is not exactly our managed bootstrap template.
+    param([string]$ExistingText)
+    $cur = Normalize-CmdFlagsText $ExistingText
+    if ($cur -eq "") { return $false }
+    $tpl = Normalize-CmdFlagsText (Get-ManagedCmdFlagsTemplate)
+    if ($cur -eq $tpl) { return $false }
+    # Also accept single-line shlex.join form of the same managed flags (optional soft match):
+    # if only whitespace/newline differences already handled; anything else needs merge.
+    return $true
+}
+
+function Resolve-CmdFlagsPython {
+    # Lightweight system Python ONLY for CMD_FLAGS codec (json+shlex).
+    # NEVER use TextGen portable_env (ROCm) — it hangs / takes minutes and broke clean runs.
+    # Caches on $script:CmdFlagsPython.
+    if ($script:CmdFlagsPython) { return $script:CmdFlagsPython }
+
+    $probeLog = New-Object System.Collections.Generic.List[string]
+
+    function Test-And-CachePython {
+        param(
+            [Parameter(Mandatory)][string]$Exe,
+            [string[]]$Args = @(),
+            [string]$WorkDir = $null,
+            [string]$Label = $null
+        )
+        if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) {
+            $probeLog.Add("missing  $Exe") | Out-Null
+            return $null
+        }
+        # Hard ban: portable / ROCm env must never be used for codec
+        $low = $Exe.ToLowerInvariant()
+        if ($low -match 'portable_env|textgen-8060s\\app|\\app\\app\\') {
+            $probeLog.Add("skip     portable/app python (banned for codec): $Exe") | Out-Null
+            return $null
+        }
+        if (-not $WorkDir) {
+            try { $WorkDir = Split-Path -Parent $Exe } catch { $WorkDir = $null }
+        }
+        $t = Test-PythonUsable -Exe $Exe -PrefixArgs $Args -WorkDir $WorkDir
+        if ($t.Ok) {
+            $script:CmdFlagsPython = [pscustomobject]@{
+                Exe     = $Exe
+                Args    = @($Args)
+                WorkDir = $WorkDir
+            }
+            $show = $Label
+            if (-not $show) { $show = $Exe }
+            Write-Ok ("CMD_FLAGS codec Python: " + $show)
+            return $script:CmdFlagsPython
+        }
+        $probeLog.Add(("fail     {0} (exit {1}) {2}" -f $Exe, $t.ExitCode, $t.Detail)) | Out-Null
+        return $null
+    }
+
+    $pyLauncher = Get-Command "py.exe" -ErrorAction SilentlyContinue
+    if ($pyLauncher) {
+        $hit = Test-And-CachePython -Exe $pyLauncher.Source -Args @("-3") -WorkDir $null -Label ("py -3 → " + $pyLauncher.Source)
+        if ($hit) { return $hit }
+    } else {
+        $probeLog.Add("missing  py.exe on PATH") | Out-Null
+    }
+
+    foreach ($name in @("python.exe", "python3.exe", "python")) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if (-not $cmd) {
+            $probeLog.Add("missing  $name on PATH") | Out-Null
+            continue
+        }
+        $work = $null
+        try { $work = Split-Path -Parent $cmd.Source } catch {}
+        $hit = Test-And-CachePython -Exe $cmd.Source -Args @() -WorkDir $work
+        if ($hit) { return $hit }
+    }
+
+    $detail = ($probeLog | ForEach-Object { "  $_" }) -join "`n"
+    throw @"
+No lightweight system Python for CMD_FLAGS codec (need: py -3 or python with json+shlex).
+TextGen portable_env is intentionally NOT used (hangs on ROCm).
+No PowerShell shlex fallback.
+
+Probe log:
+$detail
+
+Bootstrap of empty/managed CMD_FLAGS does not need Python.
+For custom CMD_FLAGS: install Python 3, or delete/rename CMD_FLAGS.txt to allow bootstrap rewrite.
 "@
 }
 
+function Get-CmdFlagsCodecPath {
+    $root = Get-ScriptRootDir
+    $p = Join-Path $root "_cmd_flags_codec.py"
+    if (-not (Test-Path -LiteralPath $p)) {
+        throw "Missing codec script: $p"
+    }
+    return $p
+}
+
+function Invoke-CmdFlagsCodec {
+    param(
+        [Parameter(Mandatory)][hashtable]$Request,
+        [int]$TimeoutSec = 60
+    )
+    $py = Resolve-CmdFlagsPython
+    $codec = Get-CmdFlagsCodecPath
+    $tmpDir = Join-Path $env:TEMP ("tg-cmdflags-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    $reqPath = Join-Path $tmpDir "request.json"
+    $respPath = Join-Path $tmpDir "response.json"
+    $stdoutPath = Join-Path $tmpDir "stdout.txt"
+    $stderrPath = Join-Path $tmpDir "stderr.txt"
+    try {
+        $json = $Request | ConvertTo-Json -Depth 12 -Compress
+        Set-Utf8NoBom $reqPath $json
+        $argList = @($py.Args) + @($codec, $reqPath, $respPath)
+        $opName = [string]$Request["op"]
+        if (-not $opName) { $opName = "codec" }
+        Write-Host ("  CMD_FLAGS codec: {0} via {1} (timeout {2}s)..." -f $opName, $py.Exe, $TimeoutSec) -ForegroundColor DarkGray
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $py.Exe
+        # Quote args for ProcessStartInfo.Arguments
+        $quoted = @()
+        foreach ($a in $argList) {
+            $s = [string]$a
+            if ($s -match '[\s"]') { $quoted += ('"{0}"' -f ($s -replace '"', '\"')) }
+            else { $quoted += $s }
+        }
+        $psi.Arguments = ($quoted -join " ")
+        if ($py.WorkDir) { $psi.WorkingDirectory = $py.WorkDir }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            try { $proc.Kill() } catch {}
+            throw "CMD_FLAGS codec timed out after ${TimeoutSec}s (python=$($py.Exe)). Bootstrap template does not need this path."
+        }
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+        if ($stdout) { Set-Utf8NoBom $stdoutPath $stdout }
+        if ($stderr) { Set-Utf8NoBom $stderrPath $stderr }
+
+        if (-not (Test-Path -LiteralPath $respPath)) {
+            throw ("Codec produced no response (exit {0}): {1} {2}" -f $proc.ExitCode, $stdout, $stderr)
+        }
+        $resp = Get-Content -LiteralPath $respPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $resp.ok) {
+            $err = $resp.error
+            if (-not $err) { $err = "codec failed" }
+            throw "CMD_FLAGS codec error: $err"
+        }
+        Write-Host ("  CMD_FLAGS codec: {0} done" -f $opName) -ForegroundColor DarkGray
+        return $resp
+    } finally {
+        try { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
+function Write-CmdFlagsAtomic {
+    param(
+        [Parameter(Mandatory)][string]$DesiredContent,
+        [string]$OkMessage = "CMD_FLAGS written"
+    )
+    $tmpPath = $FlagsFile + ".tmp"
+    $bakPath = $FlagsFile + ".bak"
+    try {
+        Set-Utf8NoBom $tmpPath $DesiredContent
+        if (Test-Path -LiteralPath $FlagsFile) {
+            [System.IO.File]::Replace($tmpPath, $FlagsFile, $bakPath, $true)
+        } else {
+            [System.IO.File]::Move($tmpPath, $FlagsFile)
+        }
+        Write-Ok $OkMessage
+    } finally {
+        if (Test-Path -LiteralPath $tmpPath) {
+            Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-LlamaLogFilePath {
+    if ($script:CurrentTextGenLogPath) { return $script:CurrentTextGenLogPath }
+    if (-not $UserDataDir) { return $null }
+    return (Join-Path $UserDataDir "textgen_console.log")
+}
+
+function Invoke-TextGenWithLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EntryPoint,
+        [Parameter(Mandatory)][string]$DataDir,
+        [Parameter(Mandatory)][string]$LogPath
+    )
+
+    $stream = $null
+    $writer = $null
+    try {
+        $parent = Split-Path -Parent $LogPath
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+
+        # Capture only the child TextGen console (not the launcher and not a
+        # PowerShell transcript header). FileShare.ReadWrite keeps the UI live.
+        $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+        $stream = New-Object System.IO.FileStream(
+            $LogPath,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::ReadWrite
+        )
+        $writer = New-Object System.IO.StreamWriter($stream, $utf8Bom)
+        $writer.AutoFlush = $true
+
+        & $EntryPoint --user-data-dir $DataDir 2>&1 | ForEach-Object {
+            $line = [string]$_
+            $writer.WriteLine($line)
+            Write-Host $line
+        }
+
+        $code = $LASTEXITCODE
+        if ($null -eq $code) { $code = 0 }
+        return [int]$code
+    } finally {
+        if ($writer) { $writer.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+}
+
+function Get-LlamaLogViewerExtDir {
+    if (-not $UserDataDir) { return $null }
+    return (Join-Path $UserDataDir "extensions\llama_log_viewer")
+}
+
+function Get-LlamaLogViewerScriptSource {
+    $root = Get-ScriptRootDir
+    return (Join-Path $root "llama_log_viewer\script.py")
+}
+
+function Ensure-LlamaLogViewerExtension {
+    # Deploy or remove managed extension under user_data/extensions (never *.disabled inside extensions).
+    if (-not $UserDataDir) { return }
+
+    $extDir = Get-LlamaLogViewerExtDir
+    $llamaLog = Get-LlamaLogFilePath
+    $extParent = Join-Path $UserDataDir "extensions"
+    if (-not (Test-Path -LiteralPath $extParent)) {
+        New-Item -ItemType Directory -Force -Path $extParent | Out-Null
+    }
+
+    # Clean forbidden in-extensions disabled name if left from older experiments
+    $badDisabled = Join-Path $extParent "llama_log_viewer.disabled"
+    if (Test-Path -LiteralPath $badDisabled) {
+        Remove-Item -LiteralPath $badDisabled -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Warn "Removed stale extensions\llama_log_viewer.disabled (not used)"
+    }
+
+    if ($DisableLlamaLogViewer) {
+        if ($extDir -and (Test-Path -LiteralPath $extDir)) {
+            Remove-Item -LiteralPath $extDir -Recurse -Force -ErrorAction Stop
+            Write-Ok "Removed llama_log_viewer deploy: $extDir"
+        } else {
+            Write-Ok "llama_log_viewer deploy already absent"
+        }
+        return
+    }
+
+    # enabled: deploy
+    if (-not (Test-Path -LiteralPath $extDir)) {
+        New-Item -ItemType Directory -Force -Path $extDir | Out-Null
+    }
+    $src = Get-LlamaLogViewerScriptSource
+    $dst = Join-Path $extDir "script.py"
+    if (-not (Test-Path -LiteralPath $src)) {
+        throw "Missing extension source: $src (clone/copy llama_log_viewer next to this script)"
+    }
+    Copy-Item -LiteralPath $src -Destination $dst -Force
+    $logPathFile = Join-Path $extDir "log_path.txt"
+    Set-Utf8NoBom $logPathFile ($llamaLog + "`n")
+
+    $logParent = Split-Path -Parent $llamaLog
+    if ($logParent -and -not (Test-Path -LiteralPath $logParent)) {
+        New-Item -ItemType Directory -Force -Path $logParent | Out-Null
+    }
+
+    Write-Ok "Llama log viewer → $extDir"
+    Write-Ok "log_path.txt → $llamaLog"
+}
+
 function Ensure-CmdFlags {
-    # Always sync LAN UI + OpenAI API flags (Cline, n8n, Open WebUI, etc.)
+    # 1) Empty/missing/exact-template → bootstrap managed template WITHOUT any Python.
+    # 2) Custom content → lightweight system Python shlex merge only (never portable_env).
+    # 3) Custom + no system Python → rewrite managed template (warn) so install never hangs.
     if (-not $FlagsFile) { return }
+
+    Write-Host "  CMD_FLAGS engine: v3-bootstrap (portable python banned)" -ForegroundColor DarkGray
+
     $dir = Split-Path $FlagsFile -Parent
     if ($dir -and -not (Test-Path $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
     }
-    $desired = (Get-DefaultCmdFlags).TrimEnd() + "`n"
-    $needWrite = $true
+
+    $cur = ""
     if (Test-Path -LiteralPath $FlagsFile) {
-        try {
-            $cur = (Get-Content -LiteralPath $FlagsFile -Raw -ErrorAction Stop)
-            if ($null -eq $cur) { $cur = "" }
-            # Normalize line endings for compare
-            $a = ($cur -replace "`r`n", "`n").TrimEnd()
-            $b = ($desired -replace "`r`n", "`n").TrimEnd()
-            if ($a -eq $b) { $needWrite = $false }
-        } catch {}
+        try { $cur = Get-Content -LiteralPath $FlagsFile -Raw -ErrorAction Stop } catch { $cur = "" }
+        if ($null -eq $cur) { $cur = "" }
     }
-    if ($needWrite) {
-        Set-Utf8NoBom $FlagsFile $desired
-        Write-Ok "CMD_FLAGS → API :$ApiPort key=$ApiKey (LAN 0.0.0.0)"
+
+    $needsMerge = Test-CmdFlagsNeedsPythonMerge -ExistingText $cur
+    $template = Get-ManagedCmdFlagsTemplate
+
+    if (-not $needsMerge) {
+        if ((Normalize-CmdFlagsText $cur) -eq (Normalize-CmdFlagsText $template)) {
+            Write-Ok "CMD_FLAGS already managed template (API :$ApiPort) — no Python"
+        } else {
+            Write-CmdFlagsAtomic -DesiredContent $template -OkMessage (
+                "CMD_FLAGS bootstrap → API :$ApiPort key=$ApiKey (no Python)"
+            )
+            if (-not $DisableLlamaLogViewer) {
+                Write-Ok "CMD_FLAGS: --extensions llama_log_viewer (bootstrap)"
+            }
+        }
+        return
     }
+
+    # Custom file: try system Python merge; never portable_env
+    $pyOk = $false
+    try {
+        $null = Resolve-CmdFlagsPython
+        $pyOk = $true
+    } catch {
+        Write-Warn $_.Exception.Message
+        Write-Warn "Custom CMD_FLAGS cannot be merged without system Python — rewriting managed template."
+        Write-CmdFlagsAtomic -DesiredContent $template -OkMessage (
+            "CMD_FLAGS forced bootstrap → API :$ApiPort (custom flags replaced; backup .bak if existed)"
+        )
+        return
+    }
+
+    if (-not $pyOk) { return }
+
+    $req = @{
+        op           = "merge"
+        text         = $cur
+        listen_port  = $ListenPort
+        api_port     = $ApiPort
+        api_key      = $ApiKey
+        loader       = "llama.cpp"
+    }
+    if ($DisableLlamaLogViewer) {
+        $req["extensions_remove"] = @("llama_log_viewer")
+        $req["log_file"] = $null
+        $req["remove_log_file"] = $true
+    } else {
+        $req["extensions_add"] = @("llama_log_viewer")
+        # v1.5+ reads the launcher-owned TextGen stdout/stderr tee.
+        $req["log_file"] = $null
+        $req["remove_log_file"] = $true
+    }
+
+    $resp = Invoke-CmdFlagsCodec -Request $req
+
+    $desired = [string]$resp.text
+    if (-not $resp.changed -and (Test-Path -LiteralPath $FlagsFile)) {
+        Write-Ok "CMD_FLAGS unchanged (API :$ApiPort, extensions merge checked)"
+        return
+    }
+
+    $check = Invoke-CmdFlagsCodec -Request @{ op = "parse"; text = $desired }
+    if (-not $check.ok) { throw "post-merge validate failed" }
+
+    Write-CmdFlagsAtomic -DesiredContent $desired -OkMessage (
+        "CMD_FLAGS merged → API :$ApiPort key=$ApiKey (LAN 0.0.0.0)"
+    )
+    if ($DisableLlamaLogViewer) {
+        Write-Ok "CMD_FLAGS: llama_log_viewer removed from --extensions"
+    } else {
+        Write-Ok "CMD_FLAGS: --extensions includes llama_log_viewer"
+    }
+}
+
+function Show-LlamaLogViewerHints {
+    $extDir = Get-LlamaLogViewerExtDir
+    $llamaLog = Get-LlamaLogFilePath
+    Write-Host "Llama log viewer:" -ForegroundColor Cyan
+    if ($DisableLlamaLogViewer) {
+        Write-Host "  mode:      disabled (-DisableLlamaLogViewer)"
+        Write-Host ("  extension: " + $(if ($extDir -and (Test-Path $extDir)) { $extDir } else { "ABSENT" }))
+        Write-Host "  capture:   disabled"
+    } else {
+        Write-Host "  mode:      enabled"
+        Write-Host ("  extension: " + $extDir)
+        Write-Host ("  log file:  " + $llamaLog)
+        Write-Host "  capture:   live TextGen stdout + stderr tee"
+        Write-Host "  UI tab:    Llama Logs"
+        Write-Host "  note:      starts at TextGen; no launcher/transcript header; console is preserved"
+    }
+    Write-Host ""
 }
 
 function Ensure-FirewallRules {
@@ -1101,6 +1539,13 @@ $EntryBat = Join-Path $AppDir "textgen.bat"
 $FlagsFile = Join-Path $UserDataDir "CMD_FLAGS.txt"
 $BackendFile = Join-Path $InstallRoot "BACKEND.txt"
 
+# Select the current run's log path before deploying log_path.txt. The file is
+# created later, exactly when textgen.bat starts producing console output.
+New-Item -ItemType Directory -Force -Path $UserDataDir, $LogsDir | Out-Null
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$logPath = Join-Path $LogsDir ("textgen-" + $stamp + ".log")
+$script:CurrentTextGenLogPath = $logPath
+
 Write-Host ""
 Write-Host "TextGen 8060S — install+run + Comet MCP" -ForegroundColor Green
 Write-Host ("Root:   " + $InstallRoot)
@@ -1191,9 +1636,11 @@ if ($needInstall) {
             (Join-Path $UserDataDir "instruction-templates"),
             (Join-Path $UserDataDir "grammars"),
             (Join-Path $UserDataDir "logs"),
-            (Join-Path $UserDataDir "cache")
+            (Join-Path $UserDataDir "cache"),
+            (Join-Path $UserDataDir "extensions")
         ) | ForEach-Object { New-Item -ItemType Directory -Force -Path $_ | Out-Null }
 
+        Ensure-LlamaLogViewerExtension
         Ensure-CmdFlags
         Set-Utf8NoBom $BackendFile ($selected + "`nrelease=" + $release.tag_name + "`nasset=" + $asset.name + "`n")
         Ensure-FirewallRules
@@ -1213,8 +1660,13 @@ else {
     }
 }
 
-New-Item -ItemType Directory -Force -Path $UserDataDir, $ModelsDir, $LogsDir | Out-Null
-# Every run: keep OpenAI API + LAN listen flags in sync (Cline, n8n, …)
+New-Item -ItemType Directory -Force -Path $UserDataDir, $ModelsDir, $LogsDir, (Join-Path $UserDataDir "extensions") | Out-Null
+
+# Llama log viewer deploy/remove (before CMD_FLAGS merge)
+Write-Step "Llama log viewer"
+Ensure-LlamaLogViewerExtension
+
+# Every run: merge OpenAI API + LAN listen flags + extensions (Python shlex codec)
 Ensure-CmdFlags
 Ensure-FirewallRules
 # Default character required by TextGen /v1/chat/completions (avoids HTTP 500)
@@ -1251,6 +1703,7 @@ else {
 }
 
 Show-Urls
+Show-LlamaLogViewerHints
 
 if ($NoRun) {
     Write-Host "NoRun set — exit without starting TextGen."
@@ -1278,29 +1731,44 @@ Write-Step "Starting TextGen"
 $env:NO_COLOR = "1"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
-$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$logPath = Join-Path $LogsDir ("textgen-" + $stamp + ".log")
+$env:PYTHONUNBUFFERED = "1"
 Write-Host ("Log: " + $logPath)
+
+# The launcher tees the complete TextGen child output. Keep obsolete native
+# llama file logging disabled and restore the caller environment afterwards.
+$HadPreviousLlamaLogEnv = Test-Path Env:LLAMA_ARG_LOG_FILE
+$PreviousLlamaLogEnv = $env:LLAMA_ARG_LOG_FILE
 
 $exitCode = 0
 Push-Location $AppDir
 try {
-    try { Start-Transcript -Path $logPath -Force | Out-Null } catch {}
-    & $EntryBat --user-data-dir $UserDataDir
-    $exitCode = $LASTEXITCODE
-    if ($null -eq $exitCode) { $exitCode = 0 }
+    if (-not $DisableLlamaLogViewer) {
+        Remove-Item Env:LLAMA_ARG_LOG_FILE -ErrorAction SilentlyContinue
+        Write-Ok "Native LLAMA_ARG_LOG_FILE unset; child stdout/stderr tee is active"
+    }
+
+    $exitCode = Invoke-TextGenWithLog -EntryPoint $EntryBat -DataDir $UserDataDir -LogPath $logPath
 }
 catch {
     $exitCode = 1
     Write-Host $_.Exception.ToString() -ForegroundColor Red
 }
 finally {
-    try { Stop-Transcript | Out-Null } catch {}
+    # restore caller env
+    if ($HadPreviousLlamaLogEnv) {
+        $env:LLAMA_ARG_LOG_FILE = $PreviousLlamaLogEnv
+    } else {
+        Remove-Item Env:LLAMA_ARG_LOG_FILE -ErrorAction SilentlyContinue
+    }
     Pop-Location
 }
 
-if (Test-Path $logPath) {
-    $t = Get-Content $logPath -Raw -EA SilentlyContinue
+$fullLogText = $null
+if (Test-Path -LiteralPath $logPath) {
+    try { $fullLogText = Get-Content -LiteralPath $logPath -Raw -Encoding UTF8 -ErrorAction Stop } catch {}
+}
+if ($fullLogText) {
+    $t = $fullLogText
     if ($t) {
         $m = [regex]::Matches($t, "Server process exited with code\s+(-?\d+)")
         if ($m.Count -gt 0) {
@@ -1313,7 +1781,9 @@ if (Test-Path $logPath) {
 Write-Host ""
 if ($exitCode -ne 0) {
     Write-Host ("FAILED exit " + $exitCode) -ForegroundColor Red
-    if (Test-Path $logPath) { Get-Content $logPath -Tail 40 }
+    if ($fullLogText) {
+        @($fullLogText -split "`r?`n") | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
+    }
 } else {
     Write-Host "Stopped OK" -ForegroundColor Yellow
 }
